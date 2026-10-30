@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ULTIMATE RESEARCH PIPELINE - Secure Version
+ULTIMATE RESEARCH PIPELINE (v9 - Robust Context & Sanitization)
 """
 
 import argparse
@@ -19,14 +19,14 @@ import ollama
 # ==========================================
 OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3-4b-abliterated"
-MODELFILE_PATH = "Modelfile-Qwen3-4B" # Looks in the current directory
+MODELFILE_PATH = "Modelfile-Qwen3-4B"
 RUN_TIMEOUT = 10
 MAX_ITERATIONS = 3
 
 client = ollama.Client(host=OLLAMA_HOST)
 
 # ==========================================
-# 🧠 MODEL MANAGER (Embeds the model)
+# 🧠 MODEL MANAGER
 # ==========================================
 def log(tag, message):
     print(f"[{tag}] {message}", flush=True)
@@ -92,15 +92,27 @@ def ensure_model_exists():
 # ==========================================
 # 🛠️ UTILITIES
 # ==========================================
-def strip_markdown(text):
+def clean_generated_code(text):
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<think>.*\Z", "", text, flags=re.DOTALL | re.IGNORECASE)
+    
     match = re.search(r"```(?:python|py)?[ \t]*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     if match:
-        return match.group(1).strip()
-    text = re.sub(r"^\s*```(?:python|py)?[ \t]*\n?", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\n?```\s*$", "", text)
-    return text.strip()
+        text = match.group(1).strip()
+    else:
+        text = re.sub(r"^\s*```(?:python|py)?[ \t]*\n?", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n?```\s*$", "", text)
+
+    lines = text.split('\n')
+    cleaned_lines = []
+    in_test_block = False
+    for line in lines:
+        if line.strip().startswith("assert ") or line.strip().startswith("if __name__ =="):
+            in_test_block = True
+        if not in_test_block:
+            cleaned_lines.append(line)
+            
+    return "\n".join(cleaned_lines).strip()
 
 def check_syntax(code):
     if not code.strip(): return False, "Empty code."
@@ -120,25 +132,46 @@ def run_tests_in_subprocess(code, test_harness):
             proc = subprocess.run(
                 [sys.executable, "-B", file_path],
                 capture_output=True, text=True, timeout=RUN_TIMEOUT,
-                stdin=subprocess.DEVNULL # SECURITY: Prevents hanging on input()
+                stdin=subprocess.DEVNULL 
             )
             if proc.returncode == 0:
                 return True, "All logic tests passed."
-            return False, (proc.stderr or proc.stdout).strip()[-1500:]
+            
+            raw_err = (proc.stderr or proc.stdout).strip()
+            error_lines = raw_err.split('\n')
+            clean_lines = [line for line in error_lines if not line.strip().startswith("assert ")]
+            clean_err = "\n".join(clean_lines)[-1500:]
+            
+            return False, clean_err
         except subprocess.TimeoutExpired:
             return False, f"TimeoutError: Execution exceeded {RUN_TIMEOUT}s."
 
 # ==========================================
-# 🔄 PIPELINE
+# 🔄 PIPELINE PHASE 1
 # ==========================================
 async def phase1_generate_repair(prompt, test_harness, testrun, model, max_iters):
     banner("PHASE 1: GENERATE -> VALIDATE -> REPAIR LOOP")
     current_prompt = f"Write Python code for: {prompt}\nOutput ONLY the code."
+    
+    system_prompt = (
+        "You are an expert Python developer. "
+        "Output ONLY valid, runnable Python code. "
+        "DO NOT include any markdown formatting, test cases (asserts), or explanations."
+    )
 
     for i in range(1, max_iters + 1):
         log(f"ITER {i}", "Generating code...")
-        res = await asyncio.to_thread(client.chat, model=model, messages=[{"role": "user", "content": current_prompt}])
-        code = strip_markdown(res["message"]["content"])
+        
+        res = await asyncio.to_thread(
+            client.chat, 
+            model=model, 
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": current_prompt}
+            ],
+            options={"num_ctx": 8192}
+        )
+        code = clean_generated_code(res["message"]["content"])
 
         log("VALIDATE", "Checking syntax (ast.parse)...")
         syntax_ok, syntax_err = check_syntax(code)
@@ -162,10 +195,65 @@ async def phase1_generate_repair(prompt, test_harness, testrun, model, max_iters
             return code, True
         else:
             log("FAIL", f"Logic/Runtime Error:\n{logic_err}")
-            current_prompt = f"Your code failed tests:\n{logic_err}\nFix this code:\n{code}\nOutput ONLY the fixed code."
+            current_prompt = f"Your code failed the hidden tests. Do NOT write test cases. Fix the function so it passes.\nError:\n{logic_err}\nFix this code:\n{code}\nOutput ONLY the fixed code."
 
     log("ERROR", "Max iterations reached. Returning last attempt.")
     return code, False
+
+# ==========================================
+# 🧠 PIPELINE PHASE 2
+# ==========================================
+REPORT_FORMAT = "End with 'VERDICT: MATCH' or 'VERDICT: MISMATCH' followed by a reason."
+ANALYZER_PROMPTS = {
+    "control_flow": "Compare control flow (loops, branches). " + REPORT_FORMAT,
+    "data_flow": "Compare data flow (types, mutations). " + REPORT_FORMAT,
+    "io": "Compare input/output and side effects. " + REPORT_FORMAT,
+    "library_api": "Compare libraries and APIs used. " + REPORT_FORMAT,
+    "exception": "Compare error handling and edge cases. " + REPORT_FORMAT,
+    "specification": "Does the target satisfy the source's intended spec? " + REPORT_FORMAT
+}
+ARBITER_PROMPT = (
+    "You are the final arbiter. Review the source, target, analyzer reports, and test results. "
+    "Conclude with 'FINAL VERDICT: EQUIVALENT' or 'FINAL VERDICT: INEQUIVALENT'."
+)
+
+async def call_llm(system_prompt, user_content, model):
+    try:
+        res = await asyncio.to_thread(
+            client.chat, model=model,
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
+            options={"num_ctx": 8192}
+        )
+        return clean_generated_code(res["message"]["content"])
+    except Exception as e:
+        return f"ERROR: {e}"
+
+async def phase2_semantic_audit(source_code, target_code, test_passed, model):
+    banner("PHASE 2: MATCHFIX MULTI-AGENT SEMANTIC AUDIT")
+    user_content = f"SOURCE:\n```python\n{source_code}\n```\n\nTARGET:\n```python\n{target_code}\n```"
+
+    log("ANALYZERS", "Running 6 parallel agents...")
+    tasks = [call_llm(prompt, user_content, model) for prompt in ANALYZER_PROMPTS.values()]
+    reports = await asyncio.gather(*tasks)
+
+    for name, report in zip(ANALYZER_PROMPTS.keys(), reports):
+        print(f"\n--- [{name.upper()}] ---\n{report}")
+
+    log("ARBITER", "Synthesizing final verdict...")
+    test_summary = "PASSED" if test_passed else "NOT RUN (or FAILED)"
+    
+    combined_reports = "\n\n".join(reports)
+    if len(combined_reports) > 4000:
+        combined_reports = combined_reports[:4000] + "\n...[TRUNCATED FOR CONTEXT]..."
+
+    arb_content = (
+        f"SOURCE:\n{source_code}\n\n"
+        f"TARGET:\n{target_code}\n\n"
+        f"REPORTS:\n{combined_reports}\n\n"
+        f"TEST RESULTS ON TARGET: {test_summary}"
+    )
+    arbiter_verdict = await call_llm(ARBITER_PROMPT, arb_content, model)
+    print(f"\n--- [ARBITER VERDICT] ---\n{arbiter_verdict}")
 
 # ==========================================
 # 🚀 MAIN EXECUTION
@@ -181,6 +269,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Self-contained AI Pipeline (Model + Validation)")
     p.add_argument("--prompt", default=DEFAULT_PROMPT, help="What to generate.")
     p.add_argument("--tests", help="Path to custom test asserts.")
+    p.add_argument("--reference", help="Path to reference code for semantic audit.")
     p.add_argument("--model", default=DEFAULT_MODEL, help="Model tag.")
     p.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS, help="Max repair attempts.")
     p.add_argument("--testrun", action="store_true", help="ACTUALLY EXECUTE the code. If omitted, runs in Safe Mode.")
@@ -193,7 +282,21 @@ async def main():
     if not ensure_model_exists(): return
 
     prompt = args.prompt
-    test_harness = open(args.tests, "r", encoding="utf-8").read() if args.tests else DEFAULT_TEST_HARNESS
+    
+    if args.tests:
+        if not os.path.exists(args.tests):
+            log("ERROR", f"Test file not found: '{args.tests}'.")
+            return
+        test_harness = open(args.tests, "r", encoding="utf-8").read()
+    else:
+        test_harness = DEFAULT_TEST_HARNESS
+
+    reference_code = None
+    if args.reference:
+        if not os.path.exists(args.reference):
+            log("ERROR", f"Reference file not found: '{args.reference}'.")
+            return
+        reference_code = open(args.reference, "r", encoding="utf-8").read()
 
     if args.testrun:
         log("MODE", "LIVE EXECUTION ENABLED (--testrun). Code will be executed.")
@@ -207,6 +310,12 @@ async def main():
     except Exception as e:
         print(f"Connection Error: {e}")
         return
+
+    if validated_code:
+        if reference_code:
+            await phase2_semantic_audit(reference_code, validated_code, tests_passed, args.model)
+        else:
+            log("AUDIT", "Skipping Phase 2 (MatchFix Audit) because no --reference file was provided.")
 
 if __name__ == "__main__":
     asyncio.run(main())
