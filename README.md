@@ -19,3 +19,18 @@ This repository contains research on **Abliteration** (the mathematical removal 
 5. **COMPLIANCE:** You agree not to use this model for malicious cyber activities, fraud, harassment, or any activity that violates local or international law.
 
 **If you do not agree to these terms, DO NOT download or use this model.**
+
+# 🛡️ Red-Team Sentinel
+### Safe Orchestration of Uncensored LLMs
+
+## Project Overview
+
+![Sentinel Overview](assets/images/sentinel-overview.png)
+
+## System Architecture
+
+![Sentinel Architecture](assets/images/sentinel-architecture.png)
+
+## Model Showcase
+
+![Sentinel Model](assets/images/sentinel-model.png)
